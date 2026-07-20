@@ -1,0 +1,8 @@
+{
+  "model": "pl_PL-bass-high",
+  "text": "Zażółć gęślą jaźń. Gęślą niczym gusła w \"Dziadach\" Adama Mickiewicza.",
+  "triple_leading_consonant": true,
+  "piper_effects": "--length_scale 1.15",
+  "sox_effects": "pad 1.2 0.5",
+  "output_endpoint": "192.168.1.69:12345"
+}

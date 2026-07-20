@@ -1,0 +1,24 @@
+{
+  "name": "tts-server",
+  "version": "0.1.0-dev",
+  "description": "A lightweight TTS server orchestrating Piper, Sox, and Netcat",
+  "type": "module",
+  "main": "src/main.js",
+  "author": "Ratan M. Kyeno",
+  "license": "MIT",
+  "keywords": [
+    "tts",
+    "piper",
+    "text-to-speech",
+    "audio-streaming"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "bin": {
+    "tts-server": "./bin/tts-server"
+  },
+  "scripts": {
+    "start": "node src/main.js"
+  }
+}

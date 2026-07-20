@@ -1,0 +1,29 @@
+#!/bin/sh
+#
+# TTS Server launch script. Loads .env configuration and starts the Node.js server.
+#
+# @author Ratan M. Kyeno
+# @license MIT
+#
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+ORIG_DIR="$(pwd)"
+
+if [ ! -f "$PROJECT_DIR/.env" ]; then
+    echo "ERROR: .env file not found at $PROJECT_DIR/.env"
+    echo "Please copy .env.example to .env and configure it."
+    exit 1
+fi
+
+unamestr=$(uname)
+if [ "$unamestr" = 'Linux' ]; then
+    export $(grep -v '^#' "$PROJECT_DIR/.env" | xargs -d '\n')
+elif [ "$unamestr" = 'FreeBSD' ] || [ "$unamestr" = 'Darwin' ]; then
+    export $(grep -v '^#' "$PROJECT_DIR/.env" | xargs -0)
+fi
+cd "$PROJECT_DIR"
+npm run start -- $*
+exit_code=$?
+cd "$ORIG_DIR"
+exit $exit_code

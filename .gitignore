@@ -1,0 +1,8 @@
+# env
+.env
+
+# Logs
+*.log
+
+# Workspace files
+*.code-workspace
