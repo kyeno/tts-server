@@ -240,23 +240,47 @@ export default class Controller {
 
     /**
      * Triple the leading consonant of a string for better TTS sentence beginnings.
-     * Leaves the string unchanged if it starts with a vowel or non-letter character.
+     * UTF-8 aware: uses code point iteration and Unicode property escapes.
+     * Skips transformation if the very first word has one grapheme or fewer.
      * @param {string} text
      * @returns {string}
      */
     #tripleLeadingConsonant(text) {
-        const firstChar = text[0]
-        if (!firstChar) return text
+        if (!text || text.length === 0) return text
 
+        // Find first word (skip leading whitespace), UTF-8 safe
+        const match = text.match(/^\s*(\S+)/)
+        if (!match) return text
+        const firstWord = match[1]
+
+        // Count graphemes in first word using spread (handles surrogate pairs)
+        const graphemes = [...firstWord]
+        if (graphemes.length <= 1) return text
+
+        const firstChar = graphemes[0]
         const upper = firstChar.toUpperCase()
-        const vowels = new Set(['A', 'E', 'I', 'O', 'U'])
 
-        // If first char is not a letter or is a vowel, return unchanged
-        if (!/[a-zA-Z]/.test(firstChar) || vowels.has(upper)) {
+        // Expanded vowel set including accented vowels (Polish, French, German, etc.)
+        const vowels = new Set([
+            'A', 'E', 'I', 'O', 'U',
+            'Ą', 'Ę', 'Ó',
+            'Á', 'É', 'Í', 'Ó', 'Ú', 'Ý',
+            'À', 'È', 'Ì', 'Ò', 'Ù',
+            'Â', 'Ê', 'Î', 'Ô', 'Û',
+            'Ä', 'Ë', 'Ï', 'Ö', 'Ü', 'Ÿ',
+            'Å', 'Æ', 'Ø',
+        ])
+
+        // Use Unicode property for letter check (\p{Letter} with 'u' flag)
+        if (!/\p{Letter}/u.test(firstChar) || vowels.has(upper)) {
             return text
         }
 
+        // Calculate offset: account for leading whitespace that was skipped
+        const prefixLen = match.index === undefined ? 0 : match[0].length - firstWord.length
+        const afterPrefix = text.slice(prefixLen)
+
         // Triple the leading consonant (only position 0 preserves case, rest lowercase)
-        return firstChar + firstChar.toLowerCase() + firstChar.toLowerCase() + text.slice(1)
+        return text.slice(0, prefixLen) + firstChar + firstChar.toLowerCase() + firstChar.toLowerCase() + afterPrefix.slice(1)
     }
 }
