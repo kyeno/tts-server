@@ -49,12 +49,30 @@ cp .env.example .env
 | Variable              | Required | Default               | Description                                              |
 |-----------------------|----------|-----------------------|----------------------------------------------------------|
 | `DIR_MODEL`           | ✅ Yes   | —                     | Absolute path to the Piper models directory.             |
+| `DIR_RAMDISK_MODEL`   | No       | —                     | Optional RAM disk (tmpfs) directory for model files. Models are verified and copied here on startup, then automatically cleaned up on shutdown. |
 | `ADDRESS_LISTEN`      | No       | `0.0.0.0:8080`        | Address and port for the HTTP server to bind to.         |
 | `DIR_TEMP`            | No       | `/tmp/tts-server/`    | Directory for temporary WAV files (created if missing).  |
 | `PATH_PIPER`          | No       | `$PATH` lookup        | Override path to the `piper` binary.                     |
 | `PATH_SOX`            | No       | `$PATH` lookup        | Override path to the `sox` binary.                       |
 | `PATH_NETCAT`         | No       | `$PATH` lookup        | Override path to the `netcat` binary.                    |
 | `FIRE_AND_FORGET`     | No       | `false`               | Respond immediately after validation without waiting for the audio pipeline to finish (`true`/`1` to enable). |
+
+### Performance Optimization (RAM Disk / tmpfs)
+
+Unlike `piper-server`, which typically binds to a single pre-loaded model, **TTS Server** is designed to dynamically serve *any* available model specified in the request payload. To achieve this, models and intermediate execution files are loaded per-request on the fly.
+
+To maximize throughput and prevent unnecessary write cycles on your SSD/NVMe drives, it is strongly recommended to mount a `tmpfs` partition in RAM and route both `DIR_RAMDISK_MODEL` and `DIR_TEMP` to it:
+
+```env
+DIR_RAMDISK_MODEL=/mnt/ram/tts-server/models/
+DIR_TEMP=/mnt/ram/tts-server/tmp/
+```
+
+**Example `tmpfs` mount setup:**
+```bash
+# Mount a 2GB RAM disk
+sudo mount -t tmpfs -o size=2G tmpfs /mnt/ram
+```
 
 ### Running
 

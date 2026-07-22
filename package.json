@@ -1,6 +1,6 @@
 {
   "name": "tts-server",
-  "version": "0.1.0-dev",
+  "version": "0.1.1-dev",
   "description": "A lightweight TTS server orchestrating Piper, Sox, and Netcat",
   "type": "module",
   "main": "src/main.js",

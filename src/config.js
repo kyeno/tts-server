@@ -9,6 +9,7 @@
 import { execSync } from 'node:child_process'
 import { accessSync, constants, existsSync, mkdirSync } from 'node:fs'
 import Logger from './logger.js'
+import { setupRamDisk, cleanupRamDisk } from './ramdisk.js'
 
 /**
  * Application configuration loaded from environment variables.
@@ -20,6 +21,9 @@ export default class Config {
     #piperPath
     #soxPath
     #netcatPath
+    #ramDiskActive = false
+    #ramDiskDir = null
+    #ramDiskExisted = true
 
     /**
      * @param {object} [env] - Environment variables (defaults to process.env)
@@ -47,15 +51,57 @@ export default class Config {
             }
         }
 
+        // Optional: RAM disk setup (after DIR_MODEL validation, before binary resolution)
+        this.#initRamDisk()
+
         // Validate external dependencies
         this.#piperPath = this.#resolveBinary('PATH_PIPER', 'piper')
         this.#soxPath = this.#resolveBinary('PATH_SOX', 'sox')
         this.#netcatPath = this.#resolveBinary('PATH_NETCAT', 'nc')
     }
 
-    /** @returns {string} Path to the model directory */
+    /**
+     * Initialize RAM disk if DIR_RAMDISK_MODEL is configured.
+     * Copies models from DIR_MODEL to the RAM disk after all validation checks.
+     */
+    #initRamDisk() {
+        const ramDiskPath = this.#raw.DIR_RAMDISK_MODEL
+        if (!ramDiskPath) {
+            return
+        }
+
+        this.#log.log(`RAM disk enabled: copying models from '${this.modelDir}' to '${ramDiskPath}'`)
+
+        const dirExisted = setupRamDisk(this.#raw.DIR_MODEL, ramDiskPath, this.#log.child('RamDisk'))
+        this.#ramDiskActive = true
+        this.#ramDiskDir = ramDiskPath
+        this.#ramDiskExisted = dirExisted
+        this.#log.log(`Models will be served from RAM disk: ${ramDiskPath}`)
+    }
+
+    /** @returns {string} Path to the model directory (RAM disk if active, otherwise DIR_MODEL) */
     get modelDir() {
+        if (this.#ramDiskActive && this.#ramDiskDir) {
+            return this.#ramDiskDir
+        }
         return this.#raw.DIR_MODEL
+    }
+
+    /** @returns {boolean} Whether models are being served from a RAM disk */
+    get useRamDisk() {
+        return this.#ramDiskActive
+    }
+
+    /**
+     * Clean up the RAM disk directory on shutdown.
+     * Should be called during graceful shutdown.
+     */
+    cleanupRamDisk() {
+        if (!this.#ramDiskActive || !this.#ramDiskDir) {
+            return
+        }
+        cleanupRamDisk(this.#ramDiskDir, this.#ramDiskExisted, this.#log.child('RamDisk'))
+        this.#ramDiskActive = false
     }
 
     /** @returns {string} Server bind address in "host:port" format */

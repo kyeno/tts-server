@@ -48,7 +48,11 @@ export default class Server {
         this.#registerRoutes()
 
         // Logging
-        this.#log.log(`Model directory: ${this.#config.modelDir}`)
+        if (this.#config.useRamDisk) {
+            this.#log.log(`Models served from RAM disk: ${this.#config.modelDir}`)
+        } else {
+            this.#log.log(`Model directory: ${this.#config.modelDir}`)
+        }
         this.#log.log(`Temp directory: ${this.#config.tempDir}`)
         this.#log.log(`Available models (${this.#models.count}): ${this.#models.models.join(', ')}`)
     }
@@ -105,6 +109,9 @@ export default class Server {
      * @returns {Promise<void>}
      */
     stop() {
+        // Clean up RAM disk before closing server
+        this.#config.cleanupRamDisk()
+
         return new Promise((resolve) => {
             if (!this.#httpServer) {
                 resolve()
