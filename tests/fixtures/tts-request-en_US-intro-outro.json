@@ -1,0 +1,7 @@
+{
+  "model": "en_US-hfc_female-medium",
+  "text": "The quick brown fox jumps over the lazy dog. Mind that the beast did it twice in a row!",
+  "intro": "mixkit-television-news-report-transition-3089.wav",
+  "outro": "mixkit-intro-news-sound-1151.wav",
+  "output_endpoint": "192.168.1.69:12345"
+}

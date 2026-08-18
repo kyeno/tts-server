@@ -38,7 +38,7 @@ export default class Logger {
      * @param  {...*} args - Values to log
      */
     log(...args) {
-        console.log(this.#prefix(), ...args)
+        console.log(this.#prefix(), ...this.#sanitizeArgs(args))
     }
 
     /**
@@ -46,7 +46,7 @@ export default class Logger {
      * @param  {...*} args - Values to log
      */
     error(...args) {
-        console.error(this.#prefix(), ...args)
+        console.error(this.#prefix(), ...this.#sanitizeArgs(args))
     }
 
     /**
@@ -54,7 +54,7 @@ export default class Logger {
      * @param  {...*} args - Values to log
      */
     warn(...args) {
-        console.warn(this.#prefix(), ...args)
+        console.warn(this.#prefix(), ...this.#sanitizeArgs(args))
     }
 
     /**
@@ -62,7 +62,20 @@ export default class Logger {
      * @param  {...*} args - Values to log
      */
     info(...args) {
-        console.info(this.#prefix(), ...args)
+        console.info(this.#prefix(), ...this.#sanitizeArgs(args))
+    }
+
+    /**
+     * Strip C0 control characters from string arguments so that user-supplied input
+     * (text, file names, endpoints...) cannot forge or corrupt individual log lines.
+     * Control characters are replaced by their \xNN escape form for traceability.
+     * @param {*}[] args - Original argument list
+     * @returns {*[]} Sanitized copy of the argument list
+     */
+    #sanitizeArgs(args) {
+        return args.map((arg) => typeof arg === 'string'
+            ? arg.replace(/[\u0000-\u001f\u007f]/g, (ch) => '\\x' + ch.charCodeAt(0).toString(16).padStart(2, '0'))
+            : arg)
     }
 
     /**

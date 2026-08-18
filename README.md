@@ -4,7 +4,7 @@
 
 > This is a TypeScript-free project. Stop JavaScript pollution!
 
-A lightweight Node.js HTTP server that orchestrates **Piper TTS**, optional **Sox** audio processing, and **Netcat** streaming. Zero external dependencies — pure Node.js standard library.
+A lightweight Node.js HTTP server that orchestrates **Piper TTS**, optional **Sox** audio processing, optional **Ffmpeg** intro/outro concatenation, and **Netcat** streaming. Zero external dependencies — pure Node.js standard library.
 
 ## Why?
 
@@ -25,7 +25,7 @@ This server is designed exclusively for **trusted, private LAN environments**. P
 
 - **No Authentication:** The server has no built-in authentication mechanism. Anyone who can reach the server's IP and port can invoke TTS synthesis. Deploy it behind a firewall or restrict access at the network level.
 - **No Encryption:** All communication (requests and audio streams) is transmitted in plaintext over HTTP. Do not expose this server to untrusted networks or the internet.
-- **Shell Subprocess Injection:** User-supplied `output_endpoint` values from API requests are passed directly into shell subprocess commands (netcat). While the endpoint format is validated (`IP:PORT`), there is no comprehensive sanitization against shell metacharacters. This reinforces that the server must only be accessible from trusted clients on your local network.
+- **Input Validation & Shell-Free Execution:** All external tools (Piper, Sox, Ffmpeg, Netcat) are spawned directly with explicit argument arrays — never through a shell — so user input can only ever be treated as plain arguments, never as commands. Incoming values are strictly validated before use: `output_endpoint` must be a literal `IP:PORT`, `piper_effects`/`sox_effects` may only contain CLI flags/effect names and numeric parameters, sound files must be plain file names inside `DIR_SOUNDS`, request bodies and text lengths are capped, and an optional concurrency limit (`MAX_CONCURRENT_PIPELINES`) protects against job floods. Despite this hardening, the server still has **no authentication** and will happily stream audio to any LAN address it is told to, so keep it reachable only from trusted clients on your local network.
 
 ## Server
 
@@ -35,6 +35,7 @@ This server is designed exclusively for **trusted, private LAN environments**. P
 - [`piper`](https://github.com/rhasspy/piper) (installed and available in your `$PATH`)
 - [`netcat`](https://netcat.sourceforge.net/) (installed and available in your `$PATH`)
 - [`sox`](http://sox.sourceforge.net/) *(optional, for audio effects)*
+- [`ffmpeg`](https://ffmpeg.org/) + `ffprobe` *(optional; `ffmpeg` is required for `intro`/`outro` request fields, and `ffprobe` additionally for negative `intro_spacing`. Both ship together in the same package.)*
 
 > **Note:** You are responsible for installing the required binaries on the server; setting up these underlying system dependencies is outside the scope of this project.
 
@@ -52,10 +53,13 @@ cp .env.example .env
 | `DIR_RAMDISK_MODEL`   | No       | —                     | Optional RAM disk (tmpfs) directory for model files. Models are verified and copied here on startup, then automatically cleaned up on shutdown. |
 | `ADDRESS_LISTEN`      | No       | `0.0.0.0:8080`        | Address and port for the HTTP server to bind to.         |
 | `DIR_TEMP`            | No       | `/tmp/tts-server/`    | Directory for temporary WAV files (created if missing).  |
+| `DIR_SOUNDS`          | No       | `./sounds/`           | Directory for intro/outro sound files referenced by name in requests (relative paths resolve against the project root). |
 | `PATH_PIPER`          | No       | `$PATH` lookup        | Override path to the `piper` binary.                     |
 | `PATH_SOX`            | No       | `$PATH` lookup        | Override path to the `sox` binary.                       |
 | `PATH_NETCAT`         | No       | `$PATH` lookup        | Override path to the `netcat` binary.                    |
+| `PATH_FFMPEG`         | No       | `$PATH` lookup (lazy) | Override path to the `ffmpeg` binary (only needed for `intro`/`outro`). |
 | `FIRE_AND_FORGET`     | No       | `false`               | Respond immediately after validation without waiting for the audio pipeline to finish (`true`/`1` to enable). |
+| `MAX_CONCURRENT_PIPELINES` | No  | unlimited             | Maximum number of pipelines allowed to run concurrently; excess requests receive HTTP 429 until a slot frees up (`0` or unset = no limit). Useful with `FIRE_AND_FORGET=true`. |
 
 ### Performance Optimization (RAM Disk / tmpfs)
 
@@ -196,14 +200,23 @@ Content-Type: application/json
 | `model`                   | string    | ✅ Yes   | Model filename (relative to `DIR_MODEL`)                 |
 | `text`                    | string    | ✅ Yes   | Text to synthesize (UTF-8, JSON-unescaped)               |
 | `triple_leading_consonant`| boolean/number | No   | Triple leading consonant (`true`/`1` or `false`/`0`, default: `false`) |
-| `piper_effects`           | string    | No       | Space-separated piper CLI flags                          |
-| `sox_effects`             | string    | No       | Space-separated Sox effects                              |
-| `output_endpoint`         | string    | ✅ Yes   | `"IP:PORT"` for netcat streaming                         |
+| `piper_effects`           | string    | No       | Space-separated Piper CLI flags and values (e.g. `--length_scale 1.15 --noise-w-scale 0.6`) — only flag tokens and numeric parameters are accepted |
+| `sox_effects`             | string    | No       | Space-separated Sox effect names and numeric parameters (e.g. `pitch -400 speed 0.9 reverb 10 10 50`) — anything else is rejected |
+| `intro`                   | string    | No       | Sound file name from `DIR_SOUNDS`, prepended before the speech |
+| `outro`                   | string    | No       | Sound file name from `DIR_SOUNDS`, appended after the speech  |
+| `intro_spacing`           | number    | No       | Seconds of silence between end of `intro` and start of speech; negative values overlap/mix that many seconds instead (default `0`) |
+| `output_endpoint`         | string    | ✅ Yes   | `"IP:PORT"` for netcat streaming — literal IPv4/IPv6 address + port 1–65535 |
 
 > 💡 **The `triple_leading_consonant` Workaround:** 
 > When using certain Slavic language models (Polish, Czech, Slovak, etc.), Piper TTS tends to clip the very first consonant of a sentence, making words sound unnatural (e.g., "Pozdrawiam" might be pronounced as "Ozdrawiam"). 
 > 
 > Enabling this flag triples the leading consonant before passing the text to Piper (e.g., "Pozdrawiam" → "PP Pozdrawiam"). This quick-and-dirty fix ensures that at least one consonant survives the synthesis pipeline. This transformation only targets initial consonants; sentences starting with vowels are left untouched.
+
+> **Intro / Outro:** When either field is provided, ffmpeg concatenates the named sound files (looked up in `DIR_SOUNDS`) around the synthesized speech — intro first, then speech, then outro. Only plain file names are accepted (no paths). The concatenated output is always normalized to RIFF/WAVE, Microsoft PCM 16-bit little-endian, mono, 22050 Hz, regardless of the source files' formats.
+>
+> **Intro Spacing:** `intro_spacing` (seconds, default `0`, range -60..60) controls the boundary between the intro and the speech: positive values insert that much silence after the intro; negative values overlap (mix at full volume) that many seconds of the end of the intro with the beginning of the speech. Overlap length is clamped to the actual duration of both segments, so requesting more overlap than exists simply maximizes it. It has no effect when no `intro` is given.
+>
+> Negative spacing probes segment lengths via ffprobe (resolved next to the ffmpeg binary first, then `$PATH`); if ffprobe cannot be found, requests using negative `intro_spacing` fail while all other requests keep working.
 
 **Example Request:**
 
@@ -240,14 +253,15 @@ Content-Type: application/json
 ## Pipeline Flow
 
 ```
-┌─────────┐     ┌──────┐      ┌────────┐
-│  Piper  │────>│ Sox? │───-->│ Netcat │
-│ (TTS)   │     │(opt) │      │        │
-└─────────┘     └──────┘      └────────┘
-   text            effects        IP:PORT
-   wav out         wav in/out     stream
+┌─────────┐     ┌──────┐     ┌─────────┐     ┌────────┐
+│  Piper  │────>│ Sox? │────>│Ffmpeg?  │────>│ Netcat │
+│ (TTS)   │     │(opt) │     │ (opt)   │     │        │
+└─────────┘     └──────┘     └─────────┘     └────────┘
+   text           effects       intro/outro      IP:PORT
+   wav out        wav in/out    concat+norm      stream
 ```
 
 1. **Piper** generates audio from the text using the specified model.
 2. **Sox** (optional) applies real-time audio effects to the stream.
-3. **Netcat** (optional) streams the processed audio data to the remote endpoint.
+3. **Ffmpeg** (optional, when `intro`/`outro` is requested) concatenates the sound files around the speech and normalizes the output to PCM 16-bit mono 22050 Hz WAV.
+4. **Netcat** (optional) streams the final audio data to the remote endpoint.

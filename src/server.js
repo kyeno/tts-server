@@ -44,7 +44,7 @@ export default class Server {
         this.#controller = new Controller(this.#config, this.#models, controllerLog)
 
         // Build router and register routes
-        this.#router = new Router(this.#controller)
+        this.#router = new Router(this.#log.child('Router'))
         this.#registerRoutes()
 
         // Logging

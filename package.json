@@ -19,6 +19,7 @@
     "tts-server": "./bin/tts-server"
   },
   "scripts": {
-    "start": "node src/main.js"
+    "start": "node src/main.js",
+    "test": "node tests/run-tests.mjs"
   }
 }

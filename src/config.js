@@ -8,8 +8,13 @@
 
 import { execSync } from 'node:child_process'
 import { accessSync, constants, existsSync, mkdirSync } from 'node:fs'
+import { dirname, isAbsolute, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import Logger from './logger.js'
 import { setupRamDisk, cleanupRamDisk } from './ramdisk.js'
+
+// Project root (parent directory of src/) - used to resolve relative DIR_SOUNDS values
+const PROJECT_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 
 /**
  * Application configuration loaded from environment variables.
@@ -21,6 +26,8 @@ export default class Config {
     #piperPath
     #soxPath
     #netcatPath
+    #ffmpegPath = undefined
+    #ffprobePath = undefined
     #ramDiskActive = false
     #ramDiskDir = null
     #ramDiskExisted = true
@@ -138,10 +145,108 @@ export default class Config {
         return this.#netcatPath
     }
 
+    /** @returns {string} Absolute path to the sounds directory for intro/outro files */
+    get soundsDir() {
+        const raw = this.#raw.DIR_SOUNDS || 'sounds/'
+        return isAbsolute(raw) ? raw : join(PROJECT_ROOT, raw)
+    }
+
+    /**
+     * Lazily resolve the ffmpeg binary path on first use and cache it.
+     * Unlike piper/sox/netcat, ffmpeg is only required when a request uses "intro"/"outro",
+     * so it is not resolved at startup; failures throw instead of terminating the process.
+     * @throws {Error} If ffmpeg cannot be found or PATH_FFMPEG points to an invalid file
+     * @returns {string} Resolved absolute path to the ffmpeg binary
+     */
+    getFfmpegPath() {
+        if (this.#ffmpegPath !== undefined) {
+            return this.#ffmpegPath
+        }
+
+        let path = this.#raw.PATH_FFMPEG || null
+
+        // If no custom path provided, try to resolve via `which` / `where`
+        if (!path) {
+            try {
+                path = execSync('which ffmpeg', { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] }).trim()
+            } catch {
+                throw new Error("Required dependency 'ffmpeg' not found in PATH - install it or set PATH_FFMPEG=/full/path/to/ffmpeg")
+            }
+        }
+
+        // Validate the resolved/override path exists and is executable
+        try {
+            accessSync(path, constants.X_OK)
+        } catch {
+            throw new Error(`PATH_FFMPEG points to '${path}' which does not exist or is not executable`)
+        }
+
+        this.#log.log(`Found 'ffmpeg' at: ${path}`)
+        this.#ffmpegPath = path
+        return path
+    }
+
+    /**
+     * Lazily resolve the ffprobe binary path on first use and cache it.
+     * Prefers the sibling of the resolved ffmpeg binary (they ship together),
+     * falling back to a $PATH lookup.
+     * @throws {Error} If ffprobe cannot be found or is not executable
+     * @returns {string} Resolved absolute path to the ffprobe binary
+     */
+    getFfprobePath() {
+        if (this.#ffprobePath !== undefined) {
+            return this.#ffprobePath
+        }
+
+        const candidates = []
+        try {
+            candidates.push(join(dirname(this.getFfmpegPath()), 'ffprobe'))
+        } catch {
+            // ffmpeg itself unresolvable - its error will surface instead
+        }
+
+        for (const candidate of candidates) {
+            try {
+                accessSync(candidate, constants.X_OK)
+                this.#log.log(`Found 'ffprobe' at: ${candidate}`)
+                this.#ffprobePath = candidate
+                return candidate
+            } catch {
+                // Keep looking
+            }
+        }
+
+        let path = null
+        try {
+            path = execSync('which ffprobe', { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] }).trim()
+        } catch {
+            throw new Error("Required dependency 'ffprobe' not found in PATH - it normally ships alongside ffmpeg")
+        }
+        try {
+            accessSync(path, constants.X_OK)
+        } catch {
+            throw new Error(`Resolved ffprobe '${path}' does not exist or is not executable`)
+        }
+
+        this.#log.log(`Found 'ffprobe' at: ${path}`)
+        this.#ffprobePath = path
+        return path
+    }
+
     /** @returns {boolean} Whether to respond immediately without waiting for pipeline */
     get fireAndForget() {
         const val = this.#raw.FIRE_AND_FORGET
         return val === 'true' || val === '1'
+    }
+
+    /**
+     * Maximum number of pipelines allowed to run concurrently.
+     * Requests beyond the limit are rejected with HTTP 429 until a slot frees up.
+     * @returns {number} The configured limit, or 0 when unlimited (default / invalid values)
+     */
+    get maxConcurrentPipelines() {
+        const val = Number.parseInt(this.#raw.MAX_CONCURRENT_PIPELINES ?? '', 10)
+        return Number.isInteger(val) && val > 0 ? val : 0
     }
 
     /**
