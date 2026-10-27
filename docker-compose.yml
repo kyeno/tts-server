@@ -1,0 +1,103 @@
+# TTS Server - Docker Compose stack.
+#
+# Single-file deployment: build args, .env support, persistent model/sound mounts,
+# tmpfs RAM disk, LAN-friendly networking and (optional) NVIDIA GPU passthrough.
+#
+# Quickstart:
+#   cp .env.example .env
+#   mkdir -p models && <put X.onnx + X.onnx.json pairs into ./models>
+#   docker compose up -d --build
+#
+# All ${VAR:-default} knobs are documented in .env.example / README.md.
+#
+# @author Ratan M. Kyeno
+# @license MIT
+
+name: tts-server
+
+services:
+  tts-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Node.js is pinned to a patched release; the build refuses older runtimes.
+        NODE_VERSION: ${TTS_NODE_VERSION:-22.23.4}
+        PIPER_VERSION: ${PIPER_VERSION:-1.8.0}
+        PIPER_CUDA: ${PIPER_CUDA:-0}
+    image: tts-server:${TTS_IMAGE_TAG:-latest}
+    container_name: tts-server
+    restart: unless-stopped
+
+    # All application settings come from your .env (see .env.example).
+    env_file:
+      - ${TTS_ENV_FILE:-.env}
+
+    environment:
+      # --- Container-side paths (override host paths from .env) -----------------
+      # DIR_MODEL / DIR_SOUNDS in .env point at host directories; inside the
+      # container they must point at the mount targets defined below.
+      ADDRESS_LISTEN: 0.0.0.0:${TTS_HTTP_PORT:-7423}
+      DIR_MODEL: /data/piper-models
+      DIR_SOUNDS: /app/sounds
+      DIR_TEMP: ${DIR_TEMP:-/tmp/tts-server/}
+      # RAM disk (tmpfs). Set DIR_RAMDISK_MODEL= (empty) in .env to disable it.
+      DIR_RAMDISK_MODEL: ${DIR_RAMDISK_MODEL:-/mnt/ram/tts-server-models}
+
+      # --- Binary locations baked into the image -------------------------------
+      PATH_PIPER: /opt/piper-venv/bin/piper
+      PATH_SOX: /usr/bin/sox
+      PATH_NETCAT: /usr/bin/nc
+      PATH_FFMPEG: /usr/bin/ffmpeg
+
+      # --- GPU: uncomment together with the `deploy:` block below and
+      #     `PIPER_CUDA=1` (see README "GPU acceleration").
+      # NVIDIA_VISIBLE_DEVICES: all
+      # NVIDIA_DRIVER_CAPABILITIES: all
+
+    # --- Persistent mounts -----------------------------------------------------
+    # Models: read-only for the server (it never writes to DIR_MODEL; the RAM disk
+    # copy is where models get loaded from). Each model needs X.onnx + X.onnx.json.
+    # Sounds: intro/outro files referenced by plain file name in requests.
+    volumes:
+      - ${MODELS_DIR:-./models}:/data/piper-models:ro
+      - ${SOUNDS_DIR:-./sounds}:/app/sounds:ro
+
+    # --- RAM disk / temp -------------------------------------------------------
+    # tmpfs keeps model loading and intermediate WAVs off your SSD (the server
+    # copies DIR_MODEL into DIR_RAMDISK_MODEL on startup). mode=1777 lets the
+    # non-root container user write there. RAM usage ~= size of your model set.
+    tmpfs:
+      - /mnt/ram/tts-server-models:size=${RAMDISK_SIZE:-2g},mode=1777
+      - /tmp/tts-server:size=${TMP_SIZE:-1g},mode=1777
+
+    # --- Networking ------------------------------------------------------------
+    # host: the server binds the real LAN port and netcat dials each client's
+    #       IP:PORT directly (src/stream-queue.js), which is what this project is
+    #       designed for. No port mapping needed.
+    # Bridge alternative: delete network_mode and use
+    #     ports: ["${TTS_HTTP_PORT:-7423}:${TTS_HTTP_PORT:-7423}"]
+    #   (outbound netcat streams then leave through the docker bridge with SNAT,
+    #    so clients see the docker host's address).
+    network_mode: host
+
+    # Graceful shutdown: src/server.js flushes the stream queue and cleans the
+    # RAM disk on SIGTERM - give in-flight streams time to finish.
+    stop_grace_period: 30s
+
+    # Hardening: the app only needs to spawn binaries and open TCP sockets.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    # --- GPU acceleration (uncomment for CUDA-accelerated Piper) ---------------
+    # Requires the NVIDIA Container Toolkit configured in /etc/docker/daemon.json
+    # (see README "GPU acceleration") and an image built with PIPER_CUDA=1.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]

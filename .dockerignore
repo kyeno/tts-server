@@ -1,0 +1,33 @@
+# Build context hygiene for the TTS Server image.
+# The image bundles src/, bin/ and package.json only - models, sounds and
+# environment files are provided at runtime via mounts / env_file.
+
+# VCS + editor
+.git
+.gitignore
+*.code-workspace
+
+# Environment files (supplied via env_file at runtime, never baked into the image)
+.env
+.env.*
+!.env.example
+
+# Runtime data provided through bind mounts
+models/
+sounds/*
+!sounds/.gitkeep
+
+# Logs / scratch
+*.log
+node_modules/
+
+# Docs (not needed in the image)
+README.md
+TODO.md
+LICENSE
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# tests/ is intentionally NOT ignored: `npm run test` is meant to run inside the
+# container (tests/run-tests.mjs shims piper/sox/nc and needs only ffmpeg + file).

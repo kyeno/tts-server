@@ -31,7 +31,7 @@ This server is designed exclusively for **trusted, private LAN environments**. P
 
 ### Requirements
 
-- **Node.js 20+** (Modern LTS version recommended)
+- **Node.js `>=22.23.4 <23`, `>=24.22.1 <25` or `>=26.12.1`** — the patched releases of the [Node.js security advisory of 2026-10-21](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases), enforced through `package.json` `engines`. Node 20.x/21.x are End-of-Life and receive no fixes.
 - [`piper`](https://github.com/rhasspy/piper) (installed and available in your `$PATH`)
 - [`netcat`](https://netcat.sourceforge.net/) (installed and available in your `$PATH`)
 - [`sox`](http://sox.sourceforge.net/) *(optional, for audio effects)*
@@ -98,6 +98,274 @@ Alternatively, if you prefer another deployment method (e.g., inside Kubernetes)
 ```bash
 node src/main.js
 ```
+
+### Docker Deployment (Optional)
+
+A containerized deployment is provided for hosts that ship Docker instead of the
+audio toolchain. The image bundles **every** runtime dependency — Node.js 22 LTS,
+`piper` (from [piper-tts](https://pypi.org/project/piper-tts/) in a Python venv),
+`sox`, `netcat` (OpenBSD) and `ffmpeg` + `ffprobe` — so the host only needs Docker
+and your model files. The regular (bare-metal) deployment above stays fully supported.
+
+| File                 | Purpose                                                                  |
+|----------------------|--------------------------------------------------------------------------|
+| `Dockerfile`         | Two-stage build: Piper venv → slim Node runtime with the audio toolchain |
+| `docker-compose.yml` | Single-file stack: env, mounts, tmpfs RAM disk, networking, GPU          |
+| `.dockerignore`      | Keeps models, sounds and `.env` out of the build context                 |
+
+#### Quickstart
+
+```bash
+cp .env.example .env
+mkdir -p models            # put Piper voices here: X.onnx + X.onnx.json pairs
+docker compose up -d --build
+curl -s localhost:7423/models
+```
+
+> Piper resolves its voice config as `<model>.onnx.json`, so each voice needs
+> **both** files (`en_US-lessac-medium.onnx` + `en_US-lessac-medium.onnx.json`).
+> The server exits at startup if the model directory is missing or empty.
+
+No models yet? Download some into `./models` with the Piper CLI that ships in the image:
+
+```bash
+docker run --rm -v "$PWD/models:/data/piper-models" tts-server:latest \
+    /opt/piper-venv/bin/python -m piper.download_voices en_US-lessac-medium --data-dir /data/piper-models
+```
+
+#### Mounts & Environment
+
+| Host path (`MODELS_DIR`, `SOUNDS_DIR`) | Container path                 | Mode | Backing variable    |
+|----------------------------------------|--------------------------------|------|---------------------|
+| `./models`                             | `/data/piper-models`           | `ro` | `DIR_MODEL`         |
+| `./sounds`                             | `/app/sounds`                  | `ro` | `DIR_SOUNDS`        |
+| *(tmpfs, `RAMDISK_SIZE`, default `2g`)*| `/mnt/ram/tts-server-models`  | `rw` | `DIR_RAMDISK_MODEL` |
+| *(tmpfs, `TMP_SIZE`, default `1g`)*    | `/tmp/tts-server`              | `rw` | `DIR_TEMP`          |
+
+`docker compose` reads `.env` automatically (override with `TTS_ENV_FILE`). Host-side
+paths in `.env` (`DIR_MODEL`, `DIR_SOUNDS`) are intentionally **overridden** inside the
+container with the mount targets above — see the "Docker deployment" block appended to
+`.env.example` for all knobs (`TTS_HTTP_PORT`, `RAMDISK_SIZE`, `TMP_SIZE`,
+`PIPER_VERSION`, `PIPER_CUDA`, `TTS_IMAGE_TAG`).
+
+The tmpfs mounts keep model loading and intermediate WAVs off your SSD, mirroring the
+RAM disk recommendation above. The RAM disk copies the whole model set on startup, so
+`RAMDISK_SIZE` must exceed it (the server checks free space and exits if it does not
+fit). Disable it entirely with `DIR_RAMDISK_MODEL=` (empty) in `.env`.
+
+#### Networking
+
+The stack uses **host networking** by design: the server binds `TTS_HTTP_PORT`
+(default `7423`) directly on the LAN, and Netcat dials each client's `IP:PORT`
+verbatim (`src/stream-queue.js`). Clients therefore reach the server on the same
+address they see on the wire — exactly like the bare-metal deployment.
+
+Prefer isolation? Delete `network_mode: host` and publish the HTTP port instead:
+
+```yaml
+    ports:
+      - "${TTS_HTTP_PORT:-7423}:${TTS_HTTP_PORT:-7423}"
+```
+
+Outbound Netcat streams then traverse the Docker bridge with SNAT, so client devices
+see the Docker host's address (their `socat TCP-LISTEN` listener is still reached).
+The same security caveats apply as in the bare-metal case: no authentication, no
+encryption — trusted LAN only.
+
+#### Pinned Node.js Runtime (CVE Policy)
+
+The image never tracks a floating major tag. `NODE_VERSION` pins the exact base
+image (`node:22.23.4-bookworm-slim`), and the build **fails** if the runtime is older
+than `NODE_MIN_VERSION`:
+
+```
+Node.js 22.23.4 satisfies patched minimum 22.23.4
+```
+
+22.23.4 is the 22.x release of the [security advisory of 2026-10-21](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases),
+which fixes (highest severity HIGH):
+
+| CVE | Severity | Area |
+|---|---|---|
+| CVE-2026-105482 | high | `dns.resolve*()` truncates names containing a NUL byte |
+| CVE-2026-106069 | high | TLS hostname bypass for non-canonical IPv4 literals (`0127.0.0.1`) |
+| CVE-2026-105483 | high | TLS hostname bypass for fullwidth-digit IPs (26.x/24.x) |
+| CVE-2026-111497 | high | Brotli decoder out-of-bounds write → RCE |
+| CVE-2026-105481 | medium | Keep-alive socket processes a pre-request response |
+| CVE-2026-106072 | medium | Certificate validation for non-canonical IPv4 hostnames |
+| CVE-2026-106074 | medium | `crypto.randomUUID()`/`randomInt()` entropy reused from snapshots |
+| CVE-2026-106070 | low | `ZipFile` returns attacker-controlled prefix bytes |
+| CVE-2026-106071/73 | low | Permission Model over-grant and `fs.realpathSync()` bypass |
+
+The same release updates the dependencies Node bundles, which the image inherits
+verbatim — verify with:
+
+```bash
+docker run --rm --entrypoint node tts-server:latest -e 'console.log(process.versions)'
+# node 22.23.4, ares 1.34.9, openssl 3.5.9, sqlite 3.53.4, undici 6.29.1, brotli 1.1.0
+```
+
+The runtime stage also runs `apt-get upgrade` so the Debian side of the CVE list
+(`openssl`/`libssl3`, `ca-certificates` — the eMudhra CA compromise) is current, and
+`package.json` `engines` applies the same floor to bare-metal installs:
+
+```json
+"engines": { "node": ">=22.23.4 <23 || >=24.22.1 <25 || >=26.12.1" }
+```
+
+> **Keeping the pin current.** When a new advisory lands, bump the pin in one place
+> (`TTS_NODE_VERSION` in `.env`, which feeds the `NODE_VERSION` build arg) and raise
+> `NODE_MIN_VERSION` in the `Dockerfile` to match. Confirm the base tag exists before
+> building: `docker manifest inspect node:22.23.4-bookworm-slim`. The build then refuses
+> to produce an image from an unpatched runtime, so a stale mirror or a typo surfaces as
+> a build failure rather than a silently vulnerable container.
+
+For bare-metal, `npm` reports a mismatch as a warning:
+
+```
+npm warn EBADENGINE   required: { node: '>=22.23.4 <23 || >=24.22.1 <25 || >=26.12.1' },
+npm warn EBADENGINE   current: { node: 'v26.3.0', npm: '11.16.0' }
+```
+
+To turn that warning into a hard install failure, add `engine-strict=true` to `.npmrc`
+(deliberately not committed, so an aging host Node keeps working):
+
+```bash
+printf 'engine-strict=true\n' > .npmrc
+```
+
+`npm warn EBADENGINE` on your host means the local Node is older than the patched
+releases above — upgrade it (26.12.1+, 24.22.1+ or 22.23.4+) before relying on the
+bare-metal deployment.
+
+#### GPU Acceleration (Optional, Experimental)
+
+Piper supports GPU inference through its `--cuda` flag, which requires the
+`onnxruntime-gpu` package. Four things must line up: the host runtime, the image,
+the container's device access, and the per-request flag.
+
+**1. Host setup (one-time, global).** Install the
+[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html),
+then register its runtime with the Docker daemon and restart Docker:
+
+```bash
+# Debian/Ubuntu: follow the NVIDIA repo guide above. On Gentoo:
+#   emerge --ask app-containers/nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+That command writes the **global** runtime entry to `/etc/docker/daemon.json` — this
+is the host-wide change required for containers to see the GPU:
+
+```json
+{
+  "runtimes": {
+    "nvidia": {
+      "args": [],
+      "path": "nvidia-container-runtime"
+    }
+  }
+}
+```
+
+Verify the daemon exposes the runtime (`nvidia` must appear in `Runtimes:`) and that a
+container can actually reach the card:
+
+```bash
+docker info | grep -i -A1 runtimes
+docker run --rm --gpus all ubuntu:22.04 nvidia-smi
+```
+
+If `--gpus all` fails with *"could not select device driver"*, the toolkit is missing
+or `daemon.json` was not applied (restart Docker after editing it).
+
+**2. Image build.** Build the CUDA variant — `piper-tts` ships the CPU-only
+`onnxruntime` wheel, so the build replaces it with `onnxruntime-gpu`:
+
+```bash
+docker compose build --build-arg PIPER_CUDA=1
+# or tag it explicitly: docker build --build-arg PIPER_CUDA=1 -t tts-server:cuda .
+```
+
+**3. Container access.** Uncomment the `deploy:` GPU block and the two `NVIDIA_*`
+variables in `docker-compose.yml`:
+
+```yaml
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+```
+
+(If your Compose version ignores `deploy:`, add `runtime: nvidia` to the service
+instead — it works because the runtime is registered in `daemon.json`.)
+
+Verify the CUDA provider is actually reachable from the container (the libraries ship in
+the image via `LD_LIBRARY_PATH`; no host CUDA toolkit is required):
+
+```bash
+docker run --rm --gpus all tts-server:cuda \
+    /opt/piper-venv/bin/python -c "import onnxruntime as ort; print(ort.get_available_providers())"
+# expect CUDAExecutionProvider in the list, e.g.:
+#   ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+```
+
+**4. Per request.** GPU use is requested per synthesis call, because `piper_effects`
+is a request field:
+
+```json
+{
+  "model": "en_US-lessac-medium.onnx",
+  "text": "Hello from a GPU accelerated container.",
+  "piper_effects": "--cuda",
+  "output_endpoint": "127.0.0.1:12345"
+}
+```
+
+> **Caveats.** `piper-tts` depends on the CPU-only `onnxruntime` wheel (the upstream
+> Piper project documents building against `onnxruntime-gpl`); `PIPER_CUDA=1` uninstalls
+> `onnxruntime` and installs `onnxruntime-gpu` in its place, which is supported upstream
+> via `--cuda` but is not the configuration the Piper project tests. `onnxruntime-gpu`
+> links against **CUDA 13 and cuDNN 9** but does not bundle them, so the CUDA build also
+> installs the matching NVIDIA wheels (`nvidia-cublas`, `nvidia-curand`, `nvidia-cufft`,
+> `nvidia-cusolver`, `nvidia-cusparse`, `nvidia-cuda-runtime`, `nvidia-cuda-nvrtc`,
+> `nvidia-cuda-cupti`, `nvidia-nvtx`, `nvidia-cudnn-cu13`) and exposes them through
+> `LD_LIBRARY_PATH` — no CUDA toolkit is needed on the host, but the image grows to
+> roughly 4 GB. Two runtime failures are worth knowing: if the provider libraries cannot
+> load, ONNX Runtime logs *"Failed to create CUDAExecutionProvider"* and **falls back to
+> CPU silently**; if the GPU has no free VRAM, session creation fails with a
+> `BFCArena ... Failed to allocate memory` error. Check `nvidia-smi` before relying on
+> `--cuda`. CPU inference stays the default for every request that omits `--cuda`.
+
+#### In-Container Tests & Maintenance
+
+```bash
+docker compose run --rm tts-server npm run test   # integration tests (ffmpeg + file ship in the image)
+docker compose logs -f tts-server                 # job / pipeline logs
+docker compose down                               # graceful stop (SIGTERM, 30s grace)
+```
+
+The container runs as the non-root `node` user (UID 1000) with `cap_drop: ALL` and
+`no-new-privileges`. If your host model directory is owned by a different UID, make it
+world-readable (`chmod -R a+rX models`) so the bind mount can be read.
+
+**Troubleshooting**
+
+| Symptom                                        | Cause / fix                                                                     |
+|------------------------------------------------|---------------------------------------------------------------------------------|
+| `Model registry: no models found` + exit       | `models/` empty — add `X.onnx` + `X.onnx.json` pairs                             |
+| `Failed to find dependency 'piper'`            | Image built without the venv, or `PATH_PIPER` overridden — rebuild              |
+| `Not enough space on RAM disk`                 | Raise `RAMDISK_SIZE` above the size of your model set, or set `DIR_RAMDISK_MODEL=` |
+| `ffmpeg: command not found` in job logs        | Custom `PATH_FFMPEG` pointing outside the image — drop the override             |
+| Healthcheck stays `unhealthy`                  | `ADDRESS_LISTEN` port mismatch — keep `TTS_HTTP_PORT` aligned                   |
+| `--gpus all` / GPU device errors               | Missing toolkit entry in `/etc/docker/daemon.json` (step 1 above)               |
 
 ## Client device
 

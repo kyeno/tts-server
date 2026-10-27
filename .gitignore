@@ -6,3 +6,8 @@
 
 # Workspace files
 *.code-workspace
+
+# Docker deployment data (provided at runtime via bind mounts, see README)
+models/
+sounds/*
+!sounds/.gitkeep
