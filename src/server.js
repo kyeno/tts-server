@@ -109,6 +109,9 @@ export default class Server {
      * @returns {Promise<void>}
      */
     stop() {
+        // Discard queued streams and clean their temp files before closing server
+        this.#controller.shutdownQueues()
+
         // Clean up RAM disk before closing server
         this.#config.cleanupRamDisk()
 

@@ -60,6 +60,13 @@ cp .env.example .env
 | `PATH_FFMPEG`         | No       | `$PATH` lookup (lazy) | Override path to the `ffmpeg` binary (only needed for `intro`/`outro`). |
 | `FIRE_AND_FORGET`     | No       | `false`               | Respond immediately after validation without waiting for the audio pipeline to finish (`true`/`1` to enable). |
 | `MAX_CONCURRENT_PIPELINES` | No  | unlimited             | Maximum number of pipelines allowed to run concurrently; excess requests receive HTTP 429 until a slot frees up (`0` or unset = no limit). Useful with `FIRE_AND_FORGET=true`. |
+| `STREAM_QUEUE_PAUSE_MS` | No | `5000` | Pause in milliseconds between queued streams to the same `output_endpoint`. |
+
+### Per-Endpoint Stream Queue
+
+Generated audio is queued per `output_endpoint` before Netcat streaming. Requests for the same endpoint are streamed one after another, while Piper/Sox/Ffmpeg processing can run concurrently. After a stream finishes, the server waits `STREAM_QUEUE_PAUSE_MS` milliseconds before starting the next queued stream for that endpoint.
+
+The queue is in-memory and per app instance. It is independent of `FIRE_AND_FORGET`: synchronous requests wait for their queued stream to finish, while fire-and-forget requests return immediately and flush in the background. `MAX_CONCURRENT_PIPELINES` limits active generation/preparation jobs, not queued stream items.
 
 ### Performance Optimization (RAM Disk / tmpfs)
 

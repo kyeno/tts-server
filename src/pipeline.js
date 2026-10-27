@@ -7,7 +7,7 @@
  */
 
 import { execFile, spawn } from 'node:child_process'
-import { createReadStream, unlinkSync } from 'node:fs'
+import { unlinkSync } from 'node:fs'
 import Logger from './logger.js'
 
 /**
@@ -26,6 +26,7 @@ export default class Pipeline {
     #introPath
     #outroPath
     #introSpacing
+    #streamQueue = null
 
     // Temp file paths tracked for cleanup
     #piperWav = null
@@ -45,8 +46,9 @@ export default class Pipeline {
      * @param {string|null} [options.introPath] - Absolute path to an optional intro sound file
      * @param {string|null} [options.outroPath] - Absolute path to an optional outro sound file
      * @param {number|null} [options.introSpacing] - Seconds between end of intro and start of speech (negative mixes them)
+     * @param {import('./stream-queue.js').default} [options.streamQueue] - Per-endpoint stream queue
      */
-    constructor({ config, jobId, log, modelPath, text, piperEffects, soxEffects, endpoint, introPath, outroPath, introSpacing }) {
+    constructor({ config, jobId, log, modelPath, text, piperEffects, soxEffects, endpoint, introPath, outroPath, introSpacing, streamQueue }) {
         this.#config = config
         this.#jobId = jobId
         this.#log = log || new Logger({ namespace: 'Pipeline', jobId })
@@ -58,6 +60,7 @@ export default class Pipeline {
         this.#introPath = introPath || null
         this.#outroPath = outroPath || null
         this.#introSpacing = typeof introSpacing === 'number' ? introSpacing : null
+        this.#streamQueue = streamQueue || null
 
         this.#piperWav = `${this.#config.tempDir}${jobId}-piper.wav`
     }
@@ -68,10 +71,19 @@ export default class Pipeline {
     }
 
     /**
-     * Execute the full pipeline: piper -> [sox] -> [ffmpeg] -> netcat.
+     * Execute the full pipeline: prepare audio, then queue it for streaming.
      * @returns {Promise<void>} Resolves on success, rejects on failure
      */
     async run() {
+        const prepared = await this.prepare()
+        await this.stream(prepared)
+    }
+
+    /**
+     * Generate the final WAV file without streaming it.
+     * @returns {Promise<{ wavPath: string, cleanup: Function }>}
+     */
+    async prepare() {
         try {
             this.#log.log(`Starting TTS pipeline for model: ${this.#modelPath}`)
 
@@ -98,22 +110,48 @@ export default class Pipeline {
                 this.#log.log('Skipping ffmpeg (no intro/outro specified)')
             }
 
-            // Stage 4: Stream to endpoint (optional)
-            if (this.#endpoint) {
-                await this.#streamToEndpoint()
-            } else {
-                this.#log.log('Skipping netcat (no output endpoint specified)')
-                this.#cleanup(this.#processedWav)
-                this.#processedWav = null
+            const wavPath = this.#finalWav || this.#processedWav || this.#piperWav
+            if (!wavPath) {
+                throw new Error('Pipeline produced no output WAV file')
             }
 
-            this.#log.log('Pipeline complete')
+            this.#log.log('TTS preparation complete')
+            return { wavPath, cleanup: () => this.#destroy() }
         } catch (err) {
-            this.#log.error('Pipeline failed, cleaning up...')
-            throw err
-        } finally {
-            // Ensure all temp files are cleaned up
+            this.#log.error('Pipeline preparation failed, cleaning up...')
             this.#destroy()
+            throw err
+        }
+    }
+
+    /**
+     * Queue the prepared WAV file for endpoint streaming.
+     * @param {{ wavPath: string, cleanup: Function }} prepared
+     * @returns {Promise<void>}
+     */
+    async stream(prepared) {
+        if (!this.#endpoint) {
+            this.#log.log('Skipping netcat (no output endpoint specified)')
+            prepared.cleanup()
+            return
+        }
+
+        if (!this.#streamQueue) {
+            prepared.cleanup()
+            throw new Error('Pipeline requires a stream queue to stream to an endpoint')
+        }
+
+        try {
+            await this.#streamQueue.enqueue(this.#endpoint, {
+                jobId: this.#jobId,
+                wavPath: prepared.wavPath,
+                cleanup: prepared.cleanup,
+                log: this.#log,
+            })
+            this.#log.log('Queued stream completed')
+        } catch (err) {
+            prepared.cleanup()
+            throw err
         }
     }
 
@@ -365,62 +403,7 @@ export default class Pipeline {
         })
     }
 
-    /**
-     * Stage 4: Stream the final WAV file to the remote endpoint via netcat.
-     * Netcat is spawned directly with an argument array - never through a shell -
-     * and the audio file is piped into its stdin, so user-supplied host/port values
-     * can only ever be treated as plain arguments, never as commands.
-     * @returns {Promise<void>}
-     */
-    #streamToEndpoint() {
-        return new Promise((resolve, reject) => {
-            const errChunks = []
-            const filePath = this.#finalWav || this.#processedWav || this.#piperWav
 
-            this.#log.log(`Streaming to ${this.#endpoint.host}:${this.#endpoint.port}`)
-
-            let nc
-            try {
-                nc = spawn(this.#config.netcatPath, [this.#endpoint.host, this.#endpoint.port], {
-                    stdio: ['pipe', 'pipe', 'pipe'],
-                    env: process.env,
-                })
-            } catch (err) {
-                this.#cleanup(filePath)
-                return reject(new Error(`Failed to spawn netcat: ${err.message}`))
-            }
-
-            nc.stderr.on('data', (chunk) => errChunks.push(chunk))
-
-            // If the child exits early (e.g., the client went away), stop writing;
-            // the close event below reports the outcome with the usual semantics.
-            nc.stdin.on('error', () => {})
-
-            const audio = createReadStream(filePath)
-            audio.on('error', (err) => {
-                nc.kill()
-                reject(new Error(`Failed to read audio file '${filePath}': ${err.message}`))
-            })
-            audio.pipe(nc.stdin)
-
-            nc.on('error', (err) => {
-                this.#cleanup(filePath)
-                reject(new Error(`Failed to spawn netcat: ${err.message}`))
-            })
-
-            nc.on('close', (code) => {
-                if (code !== 0) {
-                    const stderr = Buffer.concat(errChunks).toString().trim()
-                    this.#log.warn(
-                        `Netcat exited with code ${code}: ${stderr || 'connection may have closed'}`
-                    )
-                } else {
-                    this.#log.log('Audio streamed successfully via netcat')
-                }
-                resolve()
-            })
-        })
-    }
 
     /**
      * Split a whitespace-delimited effects string into an argument array.

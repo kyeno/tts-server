@@ -250,6 +250,21 @@ export default class Config {
     }
 
     /**
+     * Pause in milliseconds between queued streams to the same output endpoint.
+     * Default: 5000.
+     * @returns {number}
+     */
+    get streamQueuePauseMs() {
+        const raw = this.#raw.STREAM_QUEUE_PAUSE_MS
+        if (raw === undefined || raw === '') {
+            return 5000
+        }
+
+        const val = Number.parseInt(raw, 10)
+        return Number.isFinite(val) && val >= 0 ? val : 5000
+    }
+
+    /**
      * Resolve a binary path from an optional env var, falling back to looking it up in $PATH.
      * Validates the resolved path exists and is executable.
      * @param {string} envVar - Environment variable name (e.g., "PATH_PIPER")

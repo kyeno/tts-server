@@ -12,6 +12,7 @@ import { isIP } from 'node:net'
 import { join } from 'node:path'
 import Logger from './logger.js'
 import Pipeline from './pipeline.js'
+import EndpointStreamQueue from './stream-queue.js'
 import { sendJson } from './lib/http.js'
 
 // ---------------------------------------------------------------------------
@@ -34,8 +35,9 @@ export default class Controller {
     #config
     #models
     #log
-    /** Number of pipelines currently running (sync or background) */
+    /** Number of pipelines currently preparing (sync or background) */
     #activeJobs = 0
+    #streamQueue
 
     /**
      * @param {import('./config.js').default} config
@@ -46,6 +48,15 @@ export default class Controller {
         this.#config = config
         this.#models = models
         this.#log = log || new Logger({ namespace: 'Controller' })
+        this.#streamQueue = new EndpointStreamQueue(this.#config, this.#log.child('StreamQueue'))
+    }
+
+    /**
+     * Discard queued streams and clean their temp files during graceful shutdown.
+     * @returns {Promise<void>}
+     */
+    async shutdownQueues() {
+        await this.#streamQueue.discard()
     }
 
     /**
@@ -242,9 +253,8 @@ export default class Controller {
                 detail: `Maximum number of concurrent pipelines (${maxConcurrent}) reached - try again later`,
             })
         }
-        this.#activeJobs++
 
-        // Create and run pipeline (transient object)
+        // Create pipeline (transient object). The queue serializes streaming per endpoint.
         const pipeline = new Pipeline({
             config: this.#config,
             jobId,
@@ -257,6 +267,7 @@ export default class Controller {
             introPath,
             outroPath,
             introSpacing,
+            streamQueue: this.#streamQueue,
         })
 
         // Fire-and-forget mode: respond immediately after validation, run pipeline asynchronously
@@ -266,20 +277,26 @@ export default class Controller {
             sendJson(res, 200, {
                 status: 'ok',
                 job_id: jobId,
-                message: 'TTS request accepted and processing in background',
+                message: 'TTS request accepted and queued for streaming',
             })
 
-            // Run pipeline asynchronously without blocking the response
-            pipeline.run().catch(err => {
-                jobLog.error(`Background TTS pipeline failed: ${err.message}`)
-            }).finally(() => { this.#activeJobs-- })
+            // Run pipeline asynchronously without blocking the response.
+            // The concurrency slot is released after preparation; queue flush is independent.
+            this.#runPipelineBackground(pipeline, jobLog)
 
             return
         }
 
-        // Default behavior: wait for pipeline to complete
+        // Default behavior: wait for preparation and queued streaming to complete.
+        let slotReleased = false
+        this.#activeJobs++
+
         try {
-            await pipeline.run()
+            const prepared = await pipeline.prepare()
+            this.#activeJobs--
+            slotReleased = true
+
+            await pipeline.stream(prepared)
             jobLog.log('TTS pipeline completed successfully')
 
             return sendJson(res, 200, {
@@ -288,13 +305,40 @@ export default class Controller {
                 message: 'Audio generated and streamed successfully',
             })
         } catch (err) {
+            if (!slotReleased) {
+                this.#activeJobs--
+            }
             jobLog.error(`TTS pipeline failed: ${err.message}`)
             return sendJson(res, 500, {
                 error: 'PipelineError',
                 detail: `TTS processing failed: ${err.message}`,
             })
-        } finally {
+        }
+    }
+
+    /**
+     * Run a pipeline in the background for fire-and-forget mode.
+     * The concurrency slot is released after preparation, not after queued streaming.
+     * @param {Pipeline} pipeline
+     * @param {Logger} jobLog
+     * @returns {Promise<void>}
+     */
+    async #runPipelineBackground(pipeline, jobLog) {
+        let slotReleased = false
+        this.#activeJobs++
+
+        try {
+            const prepared = await pipeline.prepare()
             this.#activeJobs--
+            slotReleased = true
+
+            await pipeline.stream(prepared)
+            jobLog.log('Background TTS pipeline completed successfully')
+        } catch (err) {
+            if (!slotReleased) {
+                this.#activeJobs--
+            }
+            jobLog.error(`Background TTS pipeline failed: ${err.message}`)
         }
     }
 

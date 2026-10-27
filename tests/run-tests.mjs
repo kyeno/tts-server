@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url'
 import Config from '../src/config.js'
 import Pipeline from '../src/pipeline.js'
 import Controller, { MAX_BODY_BYTES, MAX_TEXT_LENGTH } from '../src/controller.js'
+import EndpointStreamQueue from '../src/stream-queue.js'
 import ModelRegistry from '../src/model-registry.js'
 
 const PROJECT_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
@@ -55,6 +56,10 @@ writeFileSync(path.join(T, 'fakebin', 'piper.sh'), [
 writeFileSync(path.join(T, 'fakebin', 'sox.sh'), '#!/bin/sh\ncat "$1" > "$2"\nexit 0\n')
 // Netcat shim: captures the streamed audio for inspection
 writeFileSync(path.join(T, 'fakebin', 'nc.sh'), `#!/bin/sh\ncat > "${T}/captured.wav"\nexit 0\n`)
+// Netcat shim: appends streamed audio to a queue log for queue-order tests
+writeFileSync(path.join(T, 'fakebin', 'nc-append.sh'), `#!/bin/sh\ncat >> "${T}/queue.log"\nexit 0\n`)
+// Netcat shim: appends a start marker, delays, then appends audio for queue timing tests
+writeFileSync(path.join(T, 'fakebin', 'nc-slow-append.sh'), `#!/bin/sh\necho START >> "${T}/queue.log"\nsleep 0.5\ncat >> "${T}/queue.log"\nexit 0\n`)
 // Piper "slow" variant: delays synthesis so concurrency-limit tests can observe in-flight jobs
 writeFileSync(path.join(T, 'fakebin', 'piper-slow.sh'), [
     '#!/bin/sh',
@@ -69,7 +74,7 @@ writeFileSync(path.join(T, 'fakebin', 'piper-slow.sh'), [
     `cat "${T}/main.wav" > "$out"`,
     'exit 0',
 ].join('\n') + '\n')
-for (const f of ['piper.sh', 'piper-slow.sh', 'sox.sh', 'nc.sh']) {
+for (const f of ['piper.sh', 'piper-slow.sh', 'sox.sh', 'nc.sh', 'nc-append.sh', 'nc-slow-append.sh']) {
     chmodSync(path.join(T, 'fakebin', f), 0o755)
 }
 
@@ -103,7 +108,8 @@ const envBase = {
 }
 
 async function runPipeline(config, opts) {
-    const p = new Pipeline({ config, jobId: `job-${Math.random().toString(36).slice(2)}`, ...opts })
+    const queue = new EndpointStreamQueue(config, silentLog)
+    const p = new Pipeline({ config, jobId: `job-${Math.random().toString(36).slice(2)}`, streamQueue: queue, ...opts })
     await p.run()
 }
 function resetCapture() { rmSync(`${T}/captured.wav`, { force: true }) }
@@ -114,6 +120,17 @@ async function capturedInfo() {
 }
 const tempClean = () => readdirSync(path.join(T, 'tmp')).length === 0
 const near = (a, b, tol = 0.05) => Math.abs(a - b) < tol
+const resetQueueLog = () => rmSync(`${T}/queue.log`, { force: true })
+const queueLog = () => existsSync(`${T}/queue.log`) ? readFileSync(`${T}/queue.log`).toString() : ''
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+async function waitFor(cond, timeout = 2000) {
+    const start = Date.now()
+    while (!cond()) {
+        if (Date.now() - start > timeout) return false
+        await sleep(20)
+    }
+    return true
+}
 let info = null
 
 try {
@@ -262,6 +279,7 @@ try {
 
     async function postTts(configOverride, body) {
         resetCapture()
+        resetQueueLog()
         const cfg = configOverride || controllerConfig
         const ctrl = configOverride ? new Controller(cfg, new ModelRegistry(cfg.modelDir, silentLog), silentLog) : controller
         const req = mockRequest()
@@ -389,6 +407,144 @@ try {
         await new Promise((res) => setTimeout(res, 800))
         r = await postLimited({ model: 'test-voice', text: 'hi', output_endpoint: '127.0.0.1:9' })
         check('E6c job after slot freed -> 200 ok', r.statusCode === 200 && r.body?.status === 'ok', JSON.stringify(r.body))
+    }
+
+    // ---------- Q1: queue flushes single item ----------
+    {
+        const cfg = new Config({ ...envBase, PATH_NETCAT: path.join(T, 'fakebin', 'nc-append.sh'), STREAM_QUEUE_PAUSE_MS: '0' }, silentLog)
+        const queue = new EndpointStreamQueue(cfg, silentLog)
+        const fileA = path.join(T, 'tmp', 'q-a.wav')
+        writeFileSync(fileA, 'A')
+        resetQueueLog()
+        await queue.enqueue({ host: '127.0.0.1', port: '9999' }, {
+            jobId: 'q-a', wavPath: fileA, cleanup: () => rmSync(fileA, { force: true }),
+        })
+        check('Q1 queue streams single item', queueLog() === 'A', queueLog())
+        check('Q1 queue cleans temp file', !existsSync(fileA))
+        check('Q1 queue state empty', Object.keys(queue.stats).length === 0)
+    }
+
+    // ---------- Q2: queue serializes same endpoint ----------
+    {
+        const cfg = new Config({ ...envBase, PATH_NETCAT: path.join(T, 'fakebin', 'nc-append.sh'), STREAM_QUEUE_PAUSE_MS: '0' }, silentLog)
+        const queue = new EndpointStreamQueue(cfg, silentLog)
+        const endpoint = { host: '127.0.0.1', port: '9999' }
+        const fileA = path.join(T, 'tmp', 'q2-a.wav')
+        const fileB = path.join(T, 'tmp', 'q2-b.wav')
+        writeFileSync(fileA, 'A')
+        writeFileSync(fileB, 'B')
+        resetQueueLog()
+        const pA = queue.enqueue(endpoint, { jobId: 'q2-a', wavPath: fileA, cleanup: () => rmSync(fileA, { force: true }) })
+        const pB = queue.enqueue(endpoint, { jobId: 'q2-b', wavPath: fileB, cleanup: () => rmSync(fileB, { force: true }) })
+        await Promise.all([pA, pB])
+        check('Q2 queue serializes same endpoint', queueLog() === 'AB', queueLog())
+        check('Q2 queue cleans temp files', !existsSync(fileA) && !existsSync(fileB))
+    }
+
+    // ---------- Q3: queue picks up items added during flush ----------
+    {
+        const cfg = new Config({ ...envBase, PATH_NETCAT: path.join(T, 'fakebin', 'nc-slow-append.sh'), STREAM_QUEUE_PAUSE_MS: '0' }, silentLog)
+        const queue = new EndpointStreamQueue(cfg, silentLog)
+        const endpoint = { host: '127.0.0.1', port: '9999' }
+        const fileA = path.join(T, 'tmp', 'q3-a.wav')
+        const fileB = path.join(T, 'tmp', 'q3-b.wav')
+        writeFileSync(fileA, 'A')
+        writeFileSync(fileB, 'B')
+        resetQueueLog()
+        const pA = queue.enqueue(endpoint, { jobId: 'q3-a', wavPath: fileA, cleanup: () => rmSync(fileA, { force: true }) })
+        await sleep(50)
+        const pB = queue.enqueue(endpoint, { jobId: 'q3-b', wavPath: fileB, cleanup: () => rmSync(fileB, { force: true }) })
+        await Promise.all([pA, pB])
+        check('Q3 queue picks up items added during flush', queueLog() === 'START\nASTART\nB', queueLog())
+        check('Q3 queue cleans temp files', !existsSync(fileA) && !existsSync(fileB))
+    }
+
+    // ---------- Q4: queue picks up items added during pause ----------
+    {
+        const cfg = new Config({ ...envBase, PATH_NETCAT: path.join(T, 'fakebin', 'nc-append.sh'), STREAM_QUEUE_PAUSE_MS: '300' }, silentLog)
+        const queue = new EndpointStreamQueue(cfg, silentLog)
+        const endpoint = { host: '127.0.0.1', port: '9999' }
+        const fileA = path.join(T, 'tmp', 'q4-a.wav')
+        const fileB = path.join(T, 'tmp', 'q4-b.wav')
+        const fileC = path.join(T, 'tmp', 'q4-c.wav')
+        writeFileSync(fileA, 'A')
+        writeFileSync(fileB, 'B')
+        writeFileSync(fileC, 'C')
+        resetQueueLog()
+        const start = Date.now()
+        const pA = queue.enqueue(endpoint, { jobId: 'q4-a', wavPath: fileA, cleanup: () => rmSync(fileA, { force: true }) })
+        const pB = queue.enqueue(endpoint, { jobId: 'q4-b', wavPath: fileB, cleanup: () => rmSync(fileB, { force: true }) })
+        await sleep(50)
+        const pC = queue.enqueue(endpoint, { jobId: 'q4-c', wavPath: fileC, cleanup: () => rmSync(fileC, { force: true }) })
+        await Promise.all([pA, pB, pC])
+        const elapsed = Date.now() - start
+        check('Q4 queue picks up items added during pause', queueLog() === 'ABC', queueLog())
+        check('Q4 queue pauses before next item', elapsed >= 250, `elapsed=${elapsed}`)
+    }
+
+    // ---------- Q5: queue continues after stream failure ----------
+    {
+        const cfg = new Config({ ...envBase, PATH_NETCAT: path.join(T, 'fakebin', 'nc-append.sh'), STREAM_QUEUE_PAUSE_MS: '0' }, silentLog)
+        const queue = new EndpointStreamQueue(cfg, silentLog)
+        const endpoint = { host: '127.0.0.1', port: '9999' }
+        const missing = path.join(T, 'tmp', 'q5-missing.wav')
+        const good = path.join(T, 'tmp', 'q5-good.wav')
+        writeFileSync(good, 'B')
+        resetQueueLog()
+        const pMissing = queue.enqueue(endpoint, { jobId: 'q5-missing', wavPath: missing, cleanup: () => rmSync(missing, { force: true }) })
+        const pGood = queue.enqueue(endpoint, { jobId: 'q5-good', wavPath: good, cleanup: () => rmSync(good, { force: true }) })
+        const missingResult = await pMissing.then(() => 'resolved').catch(() => 'rejected')
+        await pGood
+        check('Q5 queue continues after stream failure', queueLog() === 'B', queueLog())
+        check('Q5 queue rejects failed item', missingResult === 'rejected', missingResult)
+        check('Q5 queue cleans failed item temp file', !existsSync(missing))
+    }
+
+    // ---------- Q6: fire-and-forget uses queue ----------
+    {
+        const cfg = new Config({ ...envBase, FIRE_AND_FORGET: 'true', PATH_NETCAT: path.join(T, 'fakebin', 'nc-append.sh'), STREAM_QUEUE_PAUSE_MS: '0' }, silentLog)
+        const ctrl = new Controller(cfg, new ModelRegistry(cfg.modelDir, silentLog), silentLog)
+        resetCapture()
+        resetQueueLog()
+        const req = mockRequest()
+        const res = mockResponse()
+        const p = ctrl.handleTts(req, res)
+        emitBody(req, { model: 'test-voice', text: 'hi', output_endpoint: '127.0.0.1:9999' })
+        await p
+        check('Q6 fire-and-forget responds immediately', res.statusCode === 200 && res.body?.status === 'ok', JSON.stringify(res.body))
+        const flushed = await waitFor(() => queueLog().length > 0)
+        check('Q6 fire-and-forget queue flushes in background', flushed && queueLog().length > 0, queueLog())
+        const cleaned = await waitFor(tempClean)
+        check('Q6 fire-and-forget queue cleans temp files', cleaned && tempClean())
+    }
+
+    // ---------- Q7: sync mode waits for queue ----------
+    {
+        const cfg = new Config({ ...envBase, PATH_NETCAT: path.join(T, 'fakebin', 'nc-slow-append.sh'), STREAM_QUEUE_PAUSE_MS: '0' }, silentLog)
+        r = await postTts(cfg, { model: 'test-voice', text: 'hi', output_endpoint: '127.0.0.1:9999' })
+        check('Q7 sync mode waits for queued stream', r.statusCode === 200 && r.body?.status === 'ok' && queueLog().includes('START'), JSON.stringify(r.body))
+    }
+
+    // ---------- Q8: queue flush does not consume pipeline slot ----------
+    {
+        const cfg = new Config({ ...envBase, FIRE_AND_FORGET: 'true', MAX_CONCURRENT_PIPELINES: '1', PATH_NETCAT: path.join(T, 'fakebin', 'nc-slow-append.sh'), STREAM_QUEUE_PAUSE_MS: '0' }, silentLog)
+        const ctrl = new Controller(cfg, new ModelRegistry(cfg.modelDir, silentLog), silentLog)
+        async function postLimited(body) {
+            resetCapture()
+            resetQueueLog()
+            const req = mockRequest()
+            const res = mockResponse()
+            const p = ctrl.handleTts(req, res)
+            emitBody(req, body)
+            await p
+            return res
+        }
+        r = await postLimited({ model: 'test-voice', text: 'hi', output_endpoint: '127.0.0.1:9999' })
+        check('Q8a first job accepted (fire-and-forget)', r.statusCode === 200 && r.body?.status === 'ok', JSON.stringify(r.body))
+        const started = await waitFor(() => queueLog().includes('START'))
+        check('Q8b first queued stream started', started && queueLog().includes('START'), queueLog())
+        r = await postLimited({ model: 'test-voice', text: 'hi', output_endpoint: '127.0.0.1:9999' })
+        check('Q8c queue flush does not consume pipeline slot', r.statusCode === 200 && r.body?.status === 'ok', JSON.stringify(r.body))
     }
 
     // ---------- E7: sound file name length guard ----------
